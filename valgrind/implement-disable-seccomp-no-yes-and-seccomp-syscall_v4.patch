@@ -1,0 +1,725 @@
+From db55e1b747d395bb08be47171f9dddd7e2520d92 Mon Sep 17 00:00:00 2001
+From: Miroslav Franc <mfranc@suse.cz>
+Date: Tue, 16 Jan 2024 21:48:56 +0100
+Subject: [PATCH] implement --disable-seccomp=[no|yes] and seccomp syscall
+
+By default seccomp is not disabled.  One has to provide
+--disable-seccomp=yes explicitly.
+
+Add documentation about disabling seccomp.
+
+Add pre and post wrappers for seccomp syscall and 4 testcases.
+
+Signed-off-by: Miroslav Franc <mfranc@suse.cz>
+---
+ configure.ac                              |  15 +++
+ coregrind/m_main.c                        |   5 +
+ coregrind/m_options.c                     |   1 +
+ coregrind/m_syswrap/priv_syswrap-linux.h  |   1 +
+ coregrind/m_syswrap/syswrap-amd64-linux.c |   2 +-
+ coregrind/m_syswrap/syswrap-arm-linux.c   |   2 +-
+ coregrind/m_syswrap/syswrap-arm64-linux.c |   2 +-
+ coregrind/m_syswrap/syswrap-linux.c       | 119 +++++++++++++++++++---
+ coregrind/m_syswrap/syswrap-ppc32-linux.c |   1 +
+ coregrind/m_syswrap/syswrap-ppc64-linux.c |   2 +-
+ coregrind/m_syswrap/syswrap-s390x-linux.c |   2 +-
+ coregrind/m_syswrap/syswrap-x86-linux.c   |   2 +-
+ coregrind/pub_core_options.h              |   4 +
+ docs/xml/manual-core.xml                  |  29 ++++++
+ include/vki/vki-linux.h                   |   5 +
+ none/tests/cmdline1.stdout.exp            |   2 +
+ none/tests/cmdline2.stdout.exp            |   2 +
+ none/tests/linux/Makefile.am              |  11 ++
+ none/tests/linux/seccomp1.c               |  19 ++++
+ none/tests/linux/seccomp1.stderr.exp      |   1 +
+ none/tests/linux/seccomp1.vgtest          |   3 +
+ none/tests/linux/seccomp2.c               |  20 ++++
+ none/tests/linux/seccomp2.stderr.exp      |   1 +
+ none/tests/linux/seccomp2.vgtest          |   4 +
+ none/tests/linux/seccomp3.c               |  49 +++++++++
+ none/tests/linux/seccomp3.stderr.exp      |   1 +
+ none/tests/linux/seccomp3.vgtest          |   4 +
+ none/tests/linux/seccomp4.c               |  50 +++++++++
+ none/tests/linux/seccomp4.stderr.exp      |   2 +
+ none/tests/linux/seccomp4.vgtest          |   4 +
+ 30 files changed, 347 insertions(+), 18 deletions(-)
+ create mode 100644 none/tests/linux/seccomp1.c
+ create mode 100644 none/tests/linux/seccomp1.stderr.exp
+ create mode 100644 none/tests/linux/seccomp1.vgtest
+ create mode 100644 none/tests/linux/seccomp2.c
+ create mode 100644 none/tests/linux/seccomp2.stderr.exp
+ create mode 100644 none/tests/linux/seccomp2.vgtest
+ create mode 100644 none/tests/linux/seccomp3.c
+ create mode 100644 none/tests/linux/seccomp3.stderr.exp
+ create mode 100644 none/tests/linux/seccomp3.vgtest
+ create mode 100644 none/tests/linux/seccomp4.c
+ create mode 100644 none/tests/linux/seccomp4.stderr.exp
+ create mode 100644 none/tests/linux/seccomp4.vgtest
+
+diff --git a/configure.ac b/configure.ac
+index 5d491b9c3..772ed9713 100755
+--- a/configure.ac
++++ b/configure.ac
+@@ -2179,6 +2179,21 @@ AC_MSG_RESULT([no])
+ 
+ AM_CONDITIONAL(HAVE_NR_MEMBARRIER, [test x$ac_have_nr_membarrier = xyes])
+ 
++AC_MSG_CHECKING([for __NR_seccomp])
++AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
++#include <linux/unistd.h>
++]], [[
++return __NR_seccomp
++]])], [
++ac_have_nr_seccomp=yes
++AC_MSG_RESULT([yes])
++], [
++ac_have_nr_seccomp=no
++AC_MSG_RESULT([no])
++])
++
++AM_CONDITIONAL(HAVE_NR_SECCOMP, [test x$ac_have_nr_seccomp = xyes])
++
+ #----------------------------------------------------------------------------
+ # Checking for supported compiler flags.
+ #----------------------------------------------------------------------------
+diff --git a/coregrind/m_main.c b/coregrind/m_main.c
+index bb4a0ca96..abc1fa34f 100644
+--- a/coregrind/m_main.c
++++ b/coregrind/m_main.c
+@@ -247,6 +247,10 @@ static void usage_NORETURN ( int need_help )
+ "                              should calls to realloc with a size of 0\n"
+ "                              free memory and return NULL or\n"
+ "                              allocate/resize and return non-NULL\n"
++#if defined(VGO_linux)
++"    --disable-seccomp=no|yes  make seccomp filter installation succeed without\n"
++"                              invoking the syscall itself [no]\n"
++#endif
+ "\n";
+ 
+    const HChar usage2[] =
+@@ -618,6 +622,7 @@ static void process_option (Clo_Mode mode,
+    else if VG_BOOL_CLO(arg, "--keep-debuginfo",   VG_(clo_keep_debuginfo)) {}
+ #if defined(VGO_linux)
+    else if VG_BOOL_CLO(arg, "--enable-debuginfod", VG_(clo_enable_debuginfod)) {}
++   else if VG_BOOL_CLO(arg, "--disable-seccomp", VG_(clo_disable_seccomp)) {}
+ #endif
+    else if VG_BOOL_CLOM(cloPD, arg, "--time-stamp",       VG_(clo_time_stamp)) {}
+    else if VG_STR_CLO(arg, "--track-fds",         tmp_str) {
+diff --git a/coregrind/m_options.c b/coregrind/m_options.c
+index 1483af2d9..b5d2d9b11 100644
+--- a/coregrind/m_options.c
++++ b/coregrind/m_options.c
+@@ -170,6 +170,7 @@ Bool VG_(clo_xtree_compress_strings) = True;
+ 
+ #if defined(VGO_linux)
+ Bool VG_(clo_enable_debuginfod) = True;
++Bool VG_(clo_disable_seccomp)   = False;
+ #endif
+ Int    VG_(clo_dump_error)     = 0;
+ Int    VG_(clo_backtrace_size) = 12;
+diff --git a/coregrind/m_syswrap/priv_syswrap-linux.h b/coregrind/m_syswrap/priv_syswrap-linux.h
+index d50cdcc98..03ef3cc04 100644
+--- a/coregrind/m_syswrap/priv_syswrap-linux.h
++++ b/coregrind/m_syswrap/priv_syswrap-linux.h
+@@ -58,6 +58,7 @@ DECL_TEMPLATE(linux, sys_tee);
+ DECL_TEMPLATE(linux, sys_vmsplice);
+ DECL_TEMPLATE(linux, sys_readahead);
+ DECL_TEMPLATE(linux, sys_move_pages);
++DECL_TEMPLATE(linux, sys_seccomp);
+ 
+ // clone is similar enough between linux variants to have a generic
+ // version, but which will call an extern defined in syswrap-<platform>-linux.c
+diff --git a/coregrind/m_syswrap/syswrap-amd64-linux.c b/coregrind/m_syswrap/syswrap-amd64-linux.c
+index d93d93721..79623fbbe 100644
+--- a/coregrind/m_syswrap/syswrap-amd64-linux.c
++++ b/coregrind/m_syswrap/syswrap-amd64-linux.c
+@@ -849,7 +849,7 @@ static SyscallTableEntry syscall_table[] = {
+    LINX_(__NR_sched_setattr,     sys_sched_setattr),    // 314
+    LINXY(__NR_sched_getattr,     sys_sched_getattr),    // 315
+    LINX_(__NR_renameat2,         sys_renameat2),        // 316
+-//   LIN__(__NR_seccomp,           sys_ni_syscall),       // 317
++   LINXY(__NR_seccomp,           sys_seccomp),          // 317
+    LINXY(__NR_getrandom,         sys_getrandom),        // 318
+    LINXY(__NR_memfd_create,      sys_memfd_create),     // 319
+ 
+diff --git a/coregrind/m_syswrap/syswrap-arm-linux.c b/coregrind/m_syswrap/syswrap-arm-linux.c
+index 21fc066d6..087f5ea61 100644
+--- a/coregrind/m_syswrap/syswrap-arm-linux.c
++++ b/coregrind/m_syswrap/syswrap-arm-linux.c
+@@ -1012,7 +1012,7 @@ static SyscallTableEntry syscall_main_table[] = {
+    LINX_(__NR_sched_setattr,     sys_sched_setattr),    // 380
+    LINXY(__NR_sched_getattr,     sys_sched_getattr),    // 381
+    LINX_(__NR_renameat2,         sys_renameat2),        // 382
+-
++   LINXY(__NR_seccomp,           sys_seccomp),          // 383
+    LINXY(__NR_getrandom,         sys_getrandom),        // 384
+    LINXY(__NR_memfd_create,      sys_memfd_create),     // 385
+ 
+diff --git a/coregrind/m_syswrap/syswrap-arm64-linux.c b/coregrind/m_syswrap/syswrap-arm64-linux.c
+index 5a24dcaf3..8860023cc 100644
+--- a/coregrind/m_syswrap/syswrap-arm64-linux.c
++++ b/coregrind/m_syswrap/syswrap-arm64-linux.c
+@@ -809,7 +809,7 @@ static SyscallTableEntry syscall_main_table[] = {
+    LINX_(__NR_sched_setattr,     sys_sched_setattr),     // 274
+    LINXY(__NR_sched_getattr,     sys_sched_getattr),     // 275
+    LINX_(__NR_renameat2,         sys_renameat2),         // 276
+-   //   (__NR_seccomp,           sys_ni_syscall),        // 277
++   LINXY(__NR_seccomp,           sys_seccomp),           // 277
+    LINXY(__NR_getrandom,         sys_getrandom),         // 278
+    LINXY(__NR_memfd_create,      sys_memfd_create),      // 279
+    LINXY(__NR_bpf,               sys_bpf),               // 280
+diff --git a/coregrind/m_syswrap/syswrap-linux.c b/coregrind/m_syswrap/syswrap-linux.c
+index 01bbba0a6..1eadd43a6 100644
+--- a/coregrind/m_syswrap/syswrap-linux.c
++++ b/coregrind/m_syswrap/syswrap-linux.c
+@@ -1455,7 +1455,8 @@ static void pre_asciiz_str(ThreadId tid, Addr str, SizeT maxlen,
+ 
+ PRE(sys_prctl)
+ {
+-   *flags |= SfMayBlock;
++   if (!VG_(clo_disable_seccomp))
++      *flags |= SfMayBlock;
+    PRINT( "sys_prctl ( %ld, %ld, %ld, %ld, %ld )", SARG1, SARG2, SARG3, SARG4, SARG5 );
+    switch (ARG1) {
+    case VKI_PR_SET_PDEATHSIG:
+@@ -1523,18 +1524,31 @@ PRE(sys_prctl)
+       PRE_REG_READ2(int, "prctl", int, option, int, ptracer_process_ID);
+       break;
+    case VKI_PR_SET_SECCOMP:
+-      /* This is a bit feeble in that it uses |option| before checking
+-         it, but at least both sides of the conditional check it. */
+-      if (ARG2 == VKI_SECCOMP_MODE_FILTER) {
+-         PRE_REG_READ3(int, "prctl", int, option, int, mode, char*, filter);
+-         if (ARG3) {
+-            /* Should check that ARG3 points at a valid struct sock_fprog.
+-               Sounds complex; hence be lame. */
+-            PRE_MEM_READ( "prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, filter)",
+-                          ARG3, 1 );
++      /* This (--disable-seccomp=yes) exists as a workaround.  prctl(SECCOMP_MODE_STRICT, ...)
++         is guaranteeed to kill valgrind and pretty much any notrivial filter provided by
++         prctl(SECCOMP_MODE_FILTER, ...) will likely do the same.  Making sure valgrind
++         is able to run undisturbed after seccomp filter is installed would require analyzing
++         cBPF program and whitelisting syscall combinations valgrind needs for itself which is
++         a lot of work and it woulddn't be a perfect sandbox emulation anyway.
++         Some programs don't allow turning off seccomp sandboxing without recompilation,
++         which is a reason while this option is useful.
++       */
++      if (VG_(clo_disable_seccomp))
++         SET_STATUS_Success(0); /* pretend seccomp syscall succeeded without invoking it */
++      else {
++         /* This is a bit feeble in that it uses |option| before checking
++            it, but at least both sides of the conditional check it. */
++         if (ARG2 == VKI_SECCOMP_MODE_FILTER) {
++            PRE_REG_READ3(int, "prctl", int, option, int, mode, char*, filter);
++            if (ARG3) {
++               /* Should check that ARG3 points at a valid struct sock_fprog.
++                  Sounds complex; hence be lame. */
++               PRE_MEM_READ( "prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, filter)",
++                             ARG3, 1 );
++            }
++         } else {
++            PRE_REG_READ2(int, "prctl", int, option, int, mode);
+          }
+-      } else {
+-         PRE_REG_READ2(int, "prctl", int, option, int, mode);
+       }
+       break;
+    case VKI_PR_CAPBSET_READ:
+@@ -1588,6 +1602,87 @@ POST(sys_prctl)
+    }
+ }
+ 
++PRE(sys_seccomp)
++{
++   PRINT( "sys_seccomp ( %ld, %ld, %ld )", SARG1, SARG2, SARG3 );
++   switch (ARG1) {
++   case VKI_SECCOMP_SET_MODE_STRICT:
++      /* Some programs don't allow turning off seccomp sandboxing without recompilation,
++         which is a reason while disabling seccomp is useful.
++      */
++      if (VG_(clo_disable_seccomp)) {
++         SET_STATUS_Success(0); /* pretend seccomp syscall succeeded without invoking it */
++      } else {
++         PRE_REG_READ3(int, "seccomp", unsigned int, operation, unsigned int, flags, void *, args);
++         if (ARG2 != 0) {
++            VG_(umsg)( "WARNING: in STRICT SECCOMP mode 2nd argument (flags) should always be 0\n" );
++         }
++         if (ARG3 != 0) {
++            VG_(umsg)( "WARNING: in STRICT SECCOMP mode 3nd argument (args) should always be NULL\n" );
++         }
++         VG_(umsg)( "WARNING: valgrind is unlikely to work in STRICT SECCOMP mode\n" );
++      }
++      break;
++   case VKI_SECCOMP_SET_MODE_FILTER:
++      /* Some programs don't allow turning off seccomp sandboxing without recompilation,
++         which is a reason while disabling seccomp is useful.
++      */
++      if (VG_(clo_disable_seccomp)) {
++         SET_STATUS_Success(0); /* pretend seccomp syscall succeeded without invoking it */
++      } else {
++         PRE_REG_READ3(int, "seccomp", unsigned int, operation, unsigned int, flags, void *, args);
++         if (ARG3 != 0) {
++            /* no idea about the size - best effort*/
++            PRE_MEM_READ( "seccomp(SECCOMP_SET_MODE_FILTER, flags, args)", ARG3, 1 );
++         } else {
++            VG_(umsg)( "WARNING: in FILTER SECCOMP mode 3nd argument (args) should point to struct sock_fprog\n" );
++         }
++         VG_(umsg)( "WARNING: valgrind might not work in FILTER SECCOMP mode\n" );
++      }
++      break;
++   case VKI_SECCOMP_GET_ACTION_AVAIL:
++      PRE_REG_READ3(int, "seccomp", unsigned int, operation, unsigned int, flags, void *, args);
++      if (ARG2 != 0) {
++         VG_(umsg)( "WARNING: in GET_ACTION_AVAIL SECCOMP mode 2nd argument (flags) should always be 0\n" );
++      }
++      if (ARG3 != 0) {
++         PRE_MEM_READ( "seccomp(SECCOMP_GET_ACTION_AVAIL, flags, args)", ARG3, sizeof(vki_uint32_t) );
++      } else {
++         VG_(umsg)( "WARNING: in GET_ACTION_AVAIL SECCOMP mode 3nd argument (args) should point to unsigned 32-bit filter return action\n" );
++      }
++      break;
++   case VKI_SECCOMP_GET_NOTIF_SIZES:
++      PRE_REG_READ3(int, "seccomp", unsigned int, operation, unsigned int, flags, void *, args);
++      if (ARG2 != 0) {
++         VG_(umsg)( "WARNING: in GET_NOTIF_SIZES SECCOMP mode 2nd argument (flags) should always be 0\n" );
++      }
++      if (ARG3 == 0) {
++         VG_(umsg)( "WARNING: in GET_NOTIF_SIZES SECCOMP mode 3nd argument (args) should point to struct seccomp_notif_sizes\n" );
++      }
++      break;
++   default:
++      /* this shouldn't trigger at the moment - linux kernel 6.7 */
++      SET_STATUS_Failure(VKI_ENOSYS); /* not implemented */
++      break;
++   }
++}
++POST(sys_seccomp)
++{
++   switch (ARG1) {
++      case VKI_SECCOMP_SET_MODE_STRICT:
++         break;
++      case VKI_SECCOMP_SET_MODE_FILTER:
++         break;
++      case VKI_SECCOMP_GET_ACTION_AVAIL:
++         break;
++      case VKI_SECCOMP_GET_NOTIF_SIZES:
++         if (ARG3 != 0) {
++            POST_MEM_WRITE( ARG3, sizeof(vki_uint16_t) * 3 );
++         }
++         break;
++   }
++}
++
+ PRE(sys_sendfile)
+ {
+    *flags |= SfMayBlock;
+diff --git a/coregrind/m_syswrap/syswrap-ppc32-linux.c b/coregrind/m_syswrap/syswrap-ppc32-linux.c
+index 7cb022131..abbf44db7 100644
+--- a/coregrind/m_syswrap/syswrap-ppc32-linux.c
++++ b/coregrind/m_syswrap/syswrap-ppc32-linux.c
+@@ -1020,6 +1020,7 @@ static SyscallTableEntry syscall_table[] = {
+    LINXY(__NR_sched_getattr,     sys_sched_getattr),    // 356
+    LINX_(__NR_renameat2,         sys_renameat2),        // 357
+ 
++   LINXY(__NR_seccomp,           sys_seccomp),          // 358
+    LINXY(__NR_getrandom,         sys_getrandom),        // 359
+    LINXY(__NR_memfd_create,      sys_memfd_create),     // 360
+ 
+diff --git a/coregrind/m_syswrap/syswrap-ppc64-linux.c b/coregrind/m_syswrap/syswrap-ppc64-linux.c
+index bd7fbb2c5..5701ee43b 100644
+--- a/coregrind/m_syswrap/syswrap-ppc64-linux.c
++++ b/coregrind/m_syswrap/syswrap-ppc64-linux.c
+@@ -1005,7 +1005,7 @@ static SyscallTableEntry syscall_table[] = {
+    LINX_(__NR_sched_setattr,     sys_sched_setattr),    // 355
+    LINXY(__NR_sched_getattr,     sys_sched_getattr),    // 356
+    LINX_(__NR_renameat2,         sys_renameat2),        // 357
+-
++   LINXY(__NR_seccomp,           sys_seccomp),          // 358
+    LINXY(__NR_getrandom,         sys_getrandom),        // 359
+    LINXY(__NR_memfd_create,      sys_memfd_create),     // 360
+ 
+diff --git a/coregrind/m_syswrap/syswrap-s390x-linux.c b/coregrind/m_syswrap/syswrap-s390x-linux.c
+index 4f03f218e..c10f7146d 100644
+--- a/coregrind/m_syswrap/syswrap-s390x-linux.c
++++ b/coregrind/m_syswrap/syswrap-s390x-linux.c
+@@ -828,7 +828,7 @@ static SyscallTableEntry syscall_table[] = {
+    LINX_(__NR_sched_setattr, sys_sched_setattr),                      // 345
+    LINXY(__NR_sched_getattr, sys_sched_getattr),                      // 346
+    LINX_(__NR_renameat2, sys_renameat2),                              // 347
+-// ?????(__NR_seccomp, ),                                             // 348
++   LINXY(__NR_seccomp, sys_seccomp),                                  // 348
+    LINXY(__NR_getrandom, sys_getrandom),                              // 349
+ 
+    LINXY(__NR_memfd_create, sys_memfd_create),                        // 350
+diff --git a/coregrind/m_syswrap/syswrap-x86-linux.c b/coregrind/m_syswrap/syswrap-x86-linux.c
+index f57b5395c..c1d043389 100644
+--- a/coregrind/m_syswrap/syswrap-x86-linux.c
++++ b/coregrind/m_syswrap/syswrap-x86-linux.c
+@@ -1583,7 +1583,7 @@ static SyscallTableEntry syscall_table[] = {
+    LINX_(__NR_sched_setattr,     sys_sched_setattr),    // 351
+    LINXY(__NR_sched_getattr,     sys_sched_getattr),    // 352
+    LINX_(__NR_renameat2,         sys_renameat2),        // 353
+-//   LIN__(__NR_seccomp,           sys_ni_syscall),       // 354
++   LINXY(__NR_seccomp,           sys_seccomp),          // 354
+ 
+    LINXY(__NR_getrandom,         sys_getrandom),        // 355
+    LINXY(__NR_memfd_create,      sys_memfd_create),     // 356
+diff --git a/coregrind/pub_core_options.h b/coregrind/pub_core_options.h
+index e949311af..5f8625082 100644
+--- a/coregrind/pub_core_options.h
++++ b/coregrind/pub_core_options.h
+@@ -131,6 +131,10 @@ extern Bool  VG_(clo_child_silent_after_fork);
+ /* If True, valgrind will attempt to query debuginfod servers for
+    any missing debuginfo. */
+ extern Bool VG_(clo_enable_debuginfod);
++
++/* If True, valgrind will fake seccomp syscall success without actually
++   invoking the syscall itself */
++extern Bool VG_(clo_disable_seccomp);
+ #endif
+ 
+ /* If the user specified --log-file=STR and/or --xml-file=STR, these
+diff --git a/docs/xml/manual-core.xml b/docs/xml/manual-core.xml
+index 296fc1c2a..7a430f557 100644
+--- a/docs/xml/manual-core.xml
++++ b/docs/xml/manual-core.xml
+@@ -1336,6 +1336,35 @@ that can report errors, e.g. Memcheck, but not Cachegrind.</para>
+     </listitem>
+   </varlistentry>
+ 
++  <varlistentry id="opt.disable-seccomp" xreflabel="--disable-seccomp">
++    <term>
++      <option><![CDATA[--disable-seccomp=<yes|no> [default: no] ]]></option>
++    </term>
++    <listitem>
++      <para>Disable seccomp sandbox filter installation.  By default, seccomp
++      is enabled which might, in some cases, cause valgrind to be killed by
++      invoking prohibited syscall.  This option exists to prevent that.
++      The default can always be explicitly overridden by giving this option.
++      </para>
++
++      <para>Seccomp is a Linux kernel security feature that allows filtering
++      of system calls and their arguments.  A process installs a filter in
++      a form of cBPF (classic Berkeley Packet Filter) program and if, in
++      the future, a systemcall or a systemcall with certain combination
++      of arguments not allowed by the filter is executed, the process itself
++      will be notified, potentially killed, by the kernel.  This might be
++      a problem for valgrind because it coeexists in the same process as
++      the program being analyzed and uses some system calls for its own
++      purposes.  Some programs that use seccomp only allow it to be disabled
++      at compile time.  Disabling seccomp at valgrind level allows such
++      programs to be analyzed by valgrind without recompilation at the cost
++      of the seccomp sandboxing not really working.  This has, of course,
++      security implications.  It's not recommended to disable seccomp to be
++      able to process untrusted data without additional measures.
++      </para>
++    </listitem>
++  </varlistentry>
++
+   <varlistentry id="opt.keep-debuginfo" xreflabel="--keep-debuginfo">
+     <term>
+       <option><![CDATA[--keep-debuginfo=<yes|no> [default: no] ]]></option>
+diff --git a/include/vki/vki-linux.h b/include/vki/vki-linux.h
+index be3d76690..2fcb3897b 100644
+--- a/include/vki/vki-linux.h
++++ b/include/vki/vki-linux.h
+@@ -4910,6 +4910,11 @@ enum vki_kcmp_type {
+ 
+ #define VKI_SECCOMP_MODE_FILTER 2
+ 
++#define VKI_SECCOMP_SET_MODE_STRICT 0
++#define VKI_SECCOMP_SET_MODE_FILTER 1
++#define VKI_SECCOMP_GET_ACTION_AVAIL 2
++#define VKI_SECCOMP_GET_NOTIF_SIZES 3
++
+ //----------------------------------------------------------------------
+ // From linux-3.19.3/include/uapi/linux/binfmts.h
+ //----------------------------------------------------------------------
+diff --git a/none/tests/cmdline1.stdout.exp b/none/tests/cmdline1.stdout.exp
+index 3b6c11609..37b8b5503 100644
+--- a/none/tests/cmdline1.stdout.exp
++++ b/none/tests/cmdline1.stdout.exp
+@@ -158,6 +158,8 @@ usage: valgrind [options] prog-and-args
+                               should calls to realloc with a size of 0
+                               free memory and return NULL or
+                               allocate/resize and return non-NULL
++    --disable-seccomp=no|yes  make seccomp filter installation succeed without
++                              invoking the syscall itself [no]
+ 
+   user options for Nulgrind:
+     (none)
+diff --git a/none/tests/cmdline2.stdout.exp b/none/tests/cmdline2.stdout.exp
+index 241d33afa..405115d1c 100644
+--- a/none/tests/cmdline2.stdout.exp
++++ b/none/tests/cmdline2.stdout.exp
+@@ -158,6 +158,8 @@ usage: valgrind [options] prog-and-args
+                               should calls to realloc with a size of 0
+                               free memory and return NULL or
+                               allocate/resize and return non-NULL
++    --disable-seccomp=no|yes  make seccomp filter installation succeed without
++                              invoking the syscall itself [no]
+ 
+   user options for Nulgrind:
+     (none)
+diff --git a/none/tests/linux/Makefile.am b/none/tests/linux/Makefile.am
+index 5299da223..915919190 100644
+--- a/none/tests/linux/Makefile.am
++++ b/none/tests/linux/Makefile.am
+@@ -9,6 +9,10 @@ EXTRA_DIST = \
+ 	brk-overflow2.stderr.exp brk-overflow2.vgtest \
+ 	clonev.stdout.exp clonev.stderr.exp clonev.vgtest \
+         membarrier.stderr.exp membarrier.vgtest \
++	seccomp1.stderr.exp seccomp1.vgtest \
++	seccomp2.stderr.exp seccomp2.vgtest \
++	seccomp3.stderr.exp seccomp3.vgtest \
++	seccomp4.stderr.exp seccomp4.vgtest \
+ 	mremap.stderr.exp mremap.stderr.exp-glibc27 mremap.stdout.exp \
+ 	    mremap.vgtest \
+ 	mremap2.stderr.exp mremap2.stdout.exp mremap2.vgtest \
+@@ -37,6 +41,13 @@ if HAVE_NR_MEMBARRIER
+         check_PROGRAMS += membarrier
+ endif
+ 
++if HAVE_NR_SECCOMP
++        check_PROGRAMS += seccomp1
++        check_PROGRAMS += seccomp2
++        check_PROGRAMS += seccomp3
++        check_PROGRAMS += seccomp4
++endif
++
+ 
+ AM_CFLAGS   += $(AM_FLAG_M3264_PRI)
+ AM_CXXFLAGS += $(AM_FLAG_M3264_PRI)
+diff --git a/none/tests/linux/seccomp1.c b/none/tests/linux/seccomp1.c
+new file mode 100644
+index 000000000..efd2f30d6
+--- /dev/null
++++ b/none/tests/linux/seccomp1.c
+@@ -0,0 +1,19 @@
++#include <stdio.h>
++#include <unistd.h>
++#include <linux/unistd.h>
++
++int main(int argc, char **argv)
++{
++   if (syscall(__NR_seccomp, 0/*SECCOMP_SET_MODE_STRICT*/, 0, NULL) != 0) {
++        fprintf(stderr, "seccomp system call shouldn't fail\n");
++        return 1;
++   }
++
++   // another call to seccomp is not allowed, unless the call above was faked successfully
++   syscall(__NR_seccomp, 0/*SECCOMP_SET_MODE_STRICT*/, 0, NULL);
++
++   // write is always allowed, but unless seccomp is disabled, but we should get here
++   fprintf(stderr, "Done.\n");
++
++   return 0;
++}
+diff --git a/none/tests/linux/seccomp1.stderr.exp b/none/tests/linux/seccomp1.stderr.exp
+new file mode 100644
+index 000000000..619c56180
+--- /dev/null
++++ b/none/tests/linux/seccomp1.stderr.exp
+@@ -0,0 +1 @@
++Done.
+diff --git a/none/tests/linux/seccomp1.vgtest b/none/tests/linux/seccomp1.vgtest
+new file mode 100644
+index 000000000..4f8bc11f2
+--- /dev/null
++++ b/none/tests/linux/seccomp1.vgtest
+@@ -0,0 +1,3 @@
++prog: seccomp1
++prereq: test -x seccomp1
++vgopts: -q --disable-seccomp=yes
+diff --git a/none/tests/linux/seccomp2.c b/none/tests/linux/seccomp2.c
+new file mode 100644
+index 000000000..ba8e9316d
+--- /dev/null
++++ b/none/tests/linux/seccomp2.c
+@@ -0,0 +1,20 @@
++/* linux 5.0 and above */
++#include <linux/seccomp.h>
++#include <stdio.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#include <string.h>
++
++int main(void)
++{
++	struct seccomp_notif_sizes x;
++        memset(&x, 0xff, sizeof(x));
++	if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &x)) {
++		perror("seccomp");
++		return 1;
++	}
++
++        fprintf(stderr, "%d %d %d\n", x.seccomp_notif != 0xffffU, x.seccomp_notif_resp != 0xffffU, x.seccomp_data != 0xffffU);
++
++        return 0;
++}
+diff --git a/none/tests/linux/seccomp2.stderr.exp b/none/tests/linux/seccomp2.stderr.exp
+new file mode 100644
+index 000000000..cc3759002
+--- /dev/null
++++ b/none/tests/linux/seccomp2.stderr.exp
+@@ -0,0 +1 @@
++1 1 1
+diff --git a/none/tests/linux/seccomp2.vgtest b/none/tests/linux/seccomp2.vgtest
+new file mode 100644
+index 000000000..c36df0ae5
+--- /dev/null
++++ b/none/tests/linux/seccomp2.vgtest
+@@ -0,0 +1,4 @@
++prereq: ../../../tests/os_test linux 5.0.0
++prog: seccomp2
++prereq: test -x seccomp2
++vgopts: -q
+diff --git a/none/tests/linux/seccomp3.c b/none/tests/linux/seccomp3.c
+new file mode 100644
+index 000000000..7ea4d8330
+--- /dev/null
++++ b/none/tests/linux/seccomp3.c
+@@ -0,0 +1,49 @@
++/* kernel 5.0 */
++#include <linux/seccomp.h>
++#include <stdio.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#include <stdint.h>
++
++#define check_action(what) \
++	if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &what)) { \
++		perror("seccomp"); \
++		return 1; \
++	}
++
++/* per include/uapi/linux/seccomp.h linux 5.0 */
++#define SECCOMP_RET_KILL_PROCESS 0x80000000U /* kill the process */
++#define SECCOMP_RET_KILL_THREAD  0x00000000U /* kill the thread */
++#define SECCOMP_RET_KILL         SECCOMP_RET_KILL_THREAD
++#define SECCOMP_RET_TRAP         0x00030000U /* disallow and force a SIGSYS */
++#define SECCOMP_RET_ERRNO        0x00050000U /* returns an errno */
++#define SECCOMP_RET_USER_NOTIF   0x7fc00000U /* notifies userspace */
++#define SECCOMP_RET_TRACE        0x7ff00000U /* pass to a tracer or disallow */
++#define SECCOMP_RET_LOG          0x7ffc0000U /* allow after logging */
++#define SECCOMP_RET_ALLOW        0x7fff0000U /* allow */
++
++int main(void)
++{
++        uint32_t action;
++
++        action = SECCOMP_RET_KILL_PROCESS;
++        check_action(action);
++        action = SECCOMP_RET_KILL;
++        check_action(action);
++        action = SECCOMP_RET_TRAP;
++        check_action(action);
++        action = SECCOMP_RET_ERRNO;
++        check_action(action);
++        action = SECCOMP_RET_USER_NOTIF;
++        check_action(action);
++        action = SECCOMP_RET_TRACE;
++        check_action(action);
++        action = SECCOMP_RET_LOG;
++        check_action(action);
++        action = SECCOMP_RET_ALLOW;
++        check_action(action);
++
++        fprintf(stderr, "Done.\n");
++
++        return 0;
++}
+diff --git a/none/tests/linux/seccomp3.stderr.exp b/none/tests/linux/seccomp3.stderr.exp
+new file mode 100644
+index 000000000..619c56180
+--- /dev/null
++++ b/none/tests/linux/seccomp3.stderr.exp
+@@ -0,0 +1 @@
++Done.
+diff --git a/none/tests/linux/seccomp3.vgtest b/none/tests/linux/seccomp3.vgtest
+new file mode 100644
+index 000000000..bde1fbd8c
+--- /dev/null
++++ b/none/tests/linux/seccomp3.vgtest
+@@ -0,0 +1,4 @@
++prereq: ../../../tests/os_test linux 5.0.0
++prog: seccomp3
++prereq: test -x seccomp3
++vgopts: -q
+diff --git a/none/tests/linux/seccomp4.c b/none/tests/linux/seccomp4.c
+new file mode 100644
+index 000000000..d1e9f34ce
+--- /dev/null
++++ b/none/tests/linux/seccomp4.c
+@@ -0,0 +1,50 @@
++// from linux 4.14
++
++#include <unistd.h>
++#include <stddef.h>
++#include <linux/seccomp.h>
++#include <linux/filter.h>
++#include <sys/syscall.h>
++#include <sys/prctl.h>
++#include <stdio.h>
++
++int main(void)
++{
++	struct sock_filter filter[] = {
++		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
++		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_alarm, 0, 1),
++		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
++		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
++	};
++
++	struct sock_fprog program = {
++		.len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
++		.filter = filter,
++	};
++
++	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
++		perror("prctl");
++		return 1;
++	}
++
++	if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program)) {
++		perror("seccomp");
++		return 2;
++	}
++
++/* With `gcc -DTESTING_THE_TESTCASE ...`  the program is killed.
++ * I assume valgrind won't use alarm syscall for this run and thus the program
++ * should work under valgrind without the macro defined.
++ */
++
++#if TESTING_THE_TESTCASE
++	if (syscall(SYS_alarm, 0)) {
++		perror("alarm");
++		return 2;
++	}
++#endif
++
++	fprintf(stderr, "Done.\n");
++
++	return 0;
++}
+diff --git a/none/tests/linux/seccomp4.stderr.exp b/none/tests/linux/seccomp4.stderr.exp
+new file mode 100644
+index 000000000..77b87ae8c
+--- /dev/null
++++ b/none/tests/linux/seccomp4.stderr.exp
+@@ -0,0 +1,2 @@
++WARNING: valgrind might not work in FILTER SECCOMP mode
++Done.
+diff --git a/none/tests/linux/seccomp4.vgtest b/none/tests/linux/seccomp4.vgtest
+new file mode 100644
+index 000000000..49c8fdc04
+--- /dev/null
++++ b/none/tests/linux/seccomp4.vgtest
+@@ -0,0 +1,4 @@
++prereq: ../../../tests/os_test linux 4.14.0
++prog: seccomp4
++prereq: test -x seccomp4
++vgopts: -q
+-- 
+2.43.0
+
